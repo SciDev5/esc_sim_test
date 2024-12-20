@@ -23,14 +23,16 @@ trait Lerp:
 impl Lerp for f32 {}
 impl Lerp for f64 {}
 
+type f = f32;
+
 #[derive(Debug, Clone, Copy)]
 enum ComponentValue {
-    Capacitive(f32), // constrains Q
-    Resistive(f32),  // constrains Q'
-    Inductive(f32),  // constrains Q''
+    Capacitive(f), // constrains Q
+    Resistive(f),  // constrains Q'
+    Inductive(f),  // constrains Q''
 }
 impl ComponentValue {
-    fn voltage(self, q: [f32; 3]) -> f32 {
+    fn voltage(self, q: [f; 3]) -> f {
         match self {
             // disallows instantaneous change in
             Self::Capacitive(c) => q[0] / c,
@@ -38,7 +40,7 @@ impl ComponentValue {
             Self::Inductive(l) => q[2] * l,
         }
     }
-    fn purturb(self, v_target: f32, i_target: [f32; 2], step: f32, factor: f32, q: &mut [f32; 3]) {
+    fn purturb(self, v_target: f, i_target: [f; 2], step: f, factor: f, q: &mut [f; 3]) {
         match self {
             Self::Capacitive(_) => {
                 // V = q[0] / C
@@ -62,14 +64,16 @@ impl ComponentValue {
 struct ComponentState {
     value: ComponentValue,
     connected_nets: [usize; 2],
-    q: [f32; 3],
-    v: f32,
+    q: [f; 3],
+    v: f,
 }
 impl ComponentState {
-    fn tick(&mut self, dt: f32) {
-        self.q[0] += self.q[1] * dt * 0.5;
+    fn tick(&mut self, dt: f) {
         self.q[1] += self.q[2] * dt;
-        self.q[0] += self.q[1] * dt * 0.5;
+        self.q[0] += self.q[1] * dt;
+        // self.q[0] += self.q[1] * dt * 0.5;
+        // self.q[1] += self.q[2] * dt;
+        // self.q[0] += self.q[1] * dt * 0.5;
         // dbg!(self.q);
     }
     fn update_v(&mut self) {
@@ -86,9 +90,9 @@ struct NetComponentEntry {
 #[derive(Debug, Clone)]
 pub struct NetState {
     components: Vec<NetComponentEntry>,
-    i_through: [f32; 2],
-    voltage_accepted: f32,
-    voltage_accum: f32,
+    i_through: [f; 2],
+    voltage_accepted: f,
+    voltage_accum: f,
 }
 
 pub fn make_rc_test() {
@@ -96,13 +100,25 @@ pub fn make_rc_test() {
         components: vec![
             ComponentState {
                 connected_nets: [0, 1],
-                value: ComponentValue::Capacitive(1.0),
-                q: [1.0, 0.0, 0.0],
+                value: ComponentValue::Inductive(0.01),
+                q: [0.0, 0.0, 0.0],
                 v: 1.0,
             },
             ComponentState {
                 connected_nets: [0, 1],
-                value: ComponentValue::Resistive(1.0),
+                value: ComponentValue::Capacitive(0.01),
+                q: [0.01, 0.0, 0.0],
+                v: 1.0,
+            },
+            // ComponentState {
+            //     connected_nets: [0, 1],
+            //     value: ComponentValue::Capacitive(1.0),
+            //     q: [1.0, 0.0, 0.0],
+            //     v: 1.0,
+            // },
+            ComponentState {
+                connected_nets: [0, 1],
+                value: ComponentValue::Resistive(10.0),
                 q: [0.0, 0.0, 0.0],
                 v: 1.0,
             },
@@ -118,6 +134,10 @@ pub fn make_rc_test() {
                         component_i: 1,
                         negate: false,
                     },
+                    NetComponentEntry {
+                        component_i: 2,
+                        negate: false,
+                    },
                 ],
                 i_through: [0.0, 0.0],
                 voltage_accepted: 0.0,
@@ -133,6 +153,10 @@ pub fn make_rc_test() {
                         component_i: 1,
                         negate: true,
                     },
+                    NetComponentEntry {
+                        component_i: 2,
+                        negate: true,
+                    },
                 ],
                 i_through: [0.0, 0.0],
                 voltage_accepted: 0.0,
@@ -143,13 +167,19 @@ pub fn make_rc_test() {
 
     dbg!(state.solve_state_initial());
 
-    let n = 10001;
-    let dt = 0.0001;
+    let n = 100_001;
+    // let n = 5;
+    let dt = 0.000_01;
     // let mut j = Vec::with_capacity(n);
+    let mut prev = Vec::new();
     for i in 0..n {
-        if i % 100 == 0 {
-            dbg!(state.components[0].v);
+        prev.push(state.components[0].v);
+        if i % 10000 == 0 {
+            dbg!(prev
+                .drain(..)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)));
         }
+        // dbg!(state.components[0].v);
         // j.push(state.components[0].v);
         if !state.tick(dt) {
             dbg!("convergence failed!");
@@ -165,13 +195,13 @@ pub struct CircuitState {
     nets: Vec<NetState>,
 }
 impl CircuitState {
-    pub fn tick(&mut self, dt: f32) -> bool {
+    pub fn tick(&mut self, dt: f) -> bool {
         for component in self.components.iter_mut() {
             component.tick(dt);
         }
         self.solve_state()
     }
-    fn perturb_voltages(&mut self, convergence_thresh: f32) -> bool {
+    fn perturb_voltages(&mut self, convergence_thresh: f) -> bool {
         for net in &mut self.nets {
             net.voltage_accum = 0.0;
         }
@@ -189,15 +219,15 @@ impl CircuitState {
         let range = self
             .nets
             .iter()
-            .map(|net| net.voltage_accum / net.components.len() as f32)
+            .map(|net| net.voltage_accum / net.components.len() as f)
             .map(|v| (v, v))
             .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
             .unwrap_or((0.0, 0.0));
-        let range = (range.1 - range.0) + 1e-8;
+        let range = (range.1 - range.0) + f::EPSILON;
 
         let mut changed = false;
         for net in &mut self.nets {
-            let new_accepted = net.voltage_accum / net.components.len() as f32;
+            let new_accepted = net.voltage_accum / net.components.len() as f;
             if (new_accepted - net.voltage_accepted).abs() / range > convergence_thresh {
                 changed = true;
             }
@@ -227,7 +257,7 @@ impl CircuitState {
             }
         }
     }
-    fn perturb_charge_states(&mut self, step: f32, convergence_thresh: f32) -> bool {
+    fn perturb_charge_states(&mut self, step: f, convergence_thresh: f) -> bool {
         self.compute_i_through();
         let mut changed = false;
         for component_state in &mut self.components {
@@ -236,9 +266,11 @@ impl CircuitState {
             let v_target = component_state
                 .connected_nets
                 .map(|net_i| self.nets[net_i].voltage_accepted);
-            let i_target = component_state
-                .connected_nets
-                .map(|net_i| self.nets[net_i].i_through);
+            let i_target = component_state.connected_nets.map(|net_i| {
+                self.nets[net_i]
+                    .i_through
+                    .map(|i| i / (self.nets[net_i].components.len() as f))
+            });
             let i_target = [
                 // (i_target[0][0] - i_target[1][0]) * 0.5,
                 // (i_target[0][1] - i_target[1][1]) * 0.5,
@@ -257,10 +289,9 @@ impl CircuitState {
 
             component_state.q = q;
 
-            changed |= q
-                .into_iter()
-                .zip(q_prev.into_iter())
-                .any(|(a, b)| (a - b).abs() / (a * b + 1e-16).abs().sqrt() > convergence_thresh);
+            changed |= q.into_iter().zip(q_prev.into_iter()).any(|(a, b)| {
+                (a - b).abs() / (a * b + f::EPSILON).abs().sqrt() > convergence_thresh
+            });
         }
         self.update_component_voltages();
 
@@ -275,8 +306,8 @@ impl CircuitState {
     }
 
     fn solve_state_initial(&mut self) -> bool {
-        const SOLVE_STEP_SIZE: f32 = 0.5;
-        const SOLVE_CONVERGENCE_THRESH: f32 = 1e-10; // converge to [1 part in 1e10] variance
+        const SOLVE_STEP_SIZE: f = 1.0;
+        const SOLVE_CONVERGENCE_THRESH: f = 0.0;
         let mut solved = false;
 
         self.update_component_voltages();
@@ -306,11 +337,11 @@ impl CircuitState {
         true
     }
     fn solve_state(&mut self) -> bool {
-        const SOLVE_STEP_SIZE: f32 = 1.0;
-        const SOLVE_CONVERGENCE_THRESH: f32 = 1e-10; // converge to [1 part in 1e10] variance
+        const SOLVE_STEP_SIZE: f = 1.0;
+        const SOLVE_CONVERGENCE_THRESH: f = 1e-3;
 
         self.update_component_voltages();
-        for i in 0..100 {
+        for i in 0..10000 {
             let mut changed = false;
             if self.perturb_voltages(SOLVE_CONVERGENCE_THRESH) {
                 changed = true;

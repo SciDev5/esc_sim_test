@@ -1,12 +1,7 @@
-// V = I R
-// V = I' L
-// V = int(t){I} / C
-
-// struct LinearSecondOrderSystemSolver {
-
-// }
-
-use std::ops::{Add, Mul, Sub};
+use std::{
+    fmt::Debug,
+    ops::{Add, Mul, Sub},
+};
 
 trait Lerp:
     Add<Self, Output = Self>
@@ -23,165 +18,284 @@ trait Lerp:
 impl Lerp for f32 {}
 impl Lerp for f64 {}
 
-type f = f32;
+type f = f64;
 
 #[derive(Debug, Clone, Copy)]
-enum ComponentValue {
-    Capacitive(f), // constrains Q
-    Resistive(f),  // constrains Q'
-    Inductive(f),  // constrains Q''
+pub enum ComponentValueEnum {
+    Linear(LinearComponentValue),
 }
-impl ComponentValue {
-    fn voltage(self, q: [f; 3]) -> f {
+impl ComponentValueEnum {
+    fn create(self, connected_nets_i: &[usize]) -> ComponentStateEnum {
         match self {
-            // disallows instantaneous change in
-            Self::Capacitive(c) => q[0] / c,
-            Self::Resistive(r) => q[1] * r,
-            Self::Inductive(l) => q[2] * l,
+            Self::Linear(v) => ComponentStateEnum::Linear(v.create(connected_nets_i)),
         }
     }
-    fn purturb(self, v_target: f, i_target: [f; 2], step: f, factor: f, q: &mut [f; 3]) {
+}
+#[derive(Debug)]
+pub enum ComponentStateEnum {
+    Linear(LinearComponentState),
+}
+impl AsRef<dyn ComponentState> for ComponentStateEnum {
+    fn as_ref<'a>(&'a self) -> &'a (dyn ComponentState + 'static) {
         match self {
-            Self::Capacitive(_) => {
-                // V = q[0] / C
-                q[1] = step.lerp(q[1], i_target[0]);
-                q[2] = step.lerp(q[2], i_target[1]);
-            }
-            Self::Resistive(r) => {
-                // V = q[1] R  ->  q[1] = V / R
-                q[1] = step.lerp(q[1], factor.lerp(v_target / r, i_target[0]));
-                q[2] = step.lerp(q[2], i_target[1]);
-            }
-            Self::Inductive(l) => {
-                // V = q[2] L  ->  q[2] = V / L
-                q[2] = step.lerp(q[2], factor.lerp(v_target / l, i_target[1]));
-            }
+            Self::Linear(v) => v,
+        }
+    }
+}
+impl AsMut<dyn ComponentState> for ComponentStateEnum {
+    fn as_mut<'a>(&'a mut self) -> &'a mut (dyn ComponentState + 'static) {
+        match self {
+            Self::Linear(v) => v,
         }
     }
 }
 
+pub trait ComponentValue: Debug + Clone + Copy {
+    type State: ComponentState;
+    fn n_terminals(&self) -> usize;
+    fn create(&self, connected_nets_i: &[usize]) -> Self::State;
+}
+pub trait ComponentState: Debug {
+    fn set_nets(&mut self, connected_nets_i: &[usize]);
+
+    fn impart_voltage_to_nets(&self, nets: &mut [NetState], step: f);
+    fn impart_currents_to_nets(&self, nets: &mut [NetState]);
+
+    fn purturb_from_nets(&mut self, nets: &mut [NetState]) -> HasConverged;
+    fn tick(&mut self, dt: f);
+}
+
 #[derive(Debug, Clone, Copy)]
-struct ComponentState {
-    value: ComponentValue,
-    connected_nets: [usize; 2],
+enum LinearComponentValue {
+    Capacitive(f),
+    Resistive(f),
+    Inductive(f),
+    Source(f),
+}
+impl ComponentValue for LinearComponentValue {
+    type State = LinearComponentState;
+    fn n_terminals(&self) -> usize {
+        2
+    }
+    fn create(&self, connected_nets_i: &[usize]) -> Self::State {
+        LinearComponentState::new(*self, connected_nets_i)
+    }
+}
+
+#[derive(Debug)]
+struct LinearComponentState {
+    connected_nets_i: [usize; 2],
+    value: LinearComponentValue,
+    /// `= [Q, Q', Q''] = [Q, I, d/dt I]`, where `Q` is charge and `I` is current from terminal 0 to 1.
     q: [f; 3],
-    v: f,
+    offset_emf: f,
 }
-impl ComponentState {
+impl LinearComponentState {
+    fn new(value: LinearComponentValue, connected_nets_i: &[usize]) -> Self {
+        let mut this = Self {
+            connected_nets_i: [0, 0],
+            value,
+            q: [0.0; 3],
+            offset_emf: 0.0,
+        };
+        this.set_nets(connected_nets_i);
+        this
+    }
+}
+impl ComponentState for LinearComponentState {
+    fn set_nets(&mut self, connected_nets_i: &[usize]) {
+        assert_eq!(
+            connected_nets_i.len(),
+            2,
+            "can only create a linear component with exactly two connected nets."
+        );
+        for i in 0..2 {
+            self.connected_nets_i[i] = connected_nets_i[i];
+        }
+    }
+
+    fn impart_voltage_to_nets(&self, nets: &mut [NetState], step: f) {
+        let v_prev =
+            nets[self.connected_nets_i[1]].voltage - nets[self.connected_nets_i[0]].voltage;
+        let v_target = self.offset_emf
+            + match self.value {
+                LinearComponentValue::Capacitive(c) => -self.q[0] / c,
+                LinearComponentValue::Resistive(r) => -self.q[1] * r,
+                LinearComponentValue::Inductive(l) => -self.q[2] * l,
+                LinearComponentValue::Source(v) => v,
+            };
+        let v_diff = (v_target - v_prev) * 0.5 * step;
+
+        let net0 = &mut nets[self.connected_nets_i[0]];
+        net0.voltage_accumulator += net0.voltage - v_diff;
+        net0.voltage_accumulator_sources += 1;
+        let net1 = &mut nets[self.connected_nets_i[1]];
+        net1.voltage_accumulator += net1.voltage + v_diff;
+        net1.voltage_accumulator_sources += 1;
+    }
+    fn impart_currents_to_nets(&self, nets: &mut [NetState]) {
+        for i in 0..2 {
+            let net0 = &mut nets[self.connected_nets_i[0]];
+            net0.current[i] -= self.q[i + 1];
+            net0.current_sources += 1;
+            let net1 = &mut nets[self.connected_nets_i[1]];
+            net1.current[i] += self.q[i + 1];
+            net1.current_sources += 1;
+        }
+    }
+
+    fn purturb_from_nets(&mut self, nets: &mut [NetState]) -> HasConverged {
+        let v_target =
+            nets[self.connected_nets_i[1]].voltage - nets[self.connected_nets_i[0]].voltage;
+        let i_target = [0, 1].map(|i| {
+            // self_current + avg( excess_current_flowing_in, -excess_current_flowing_out )
+            // attempt to force the self current to accept excess inflowing and deliver exess outflowing current.
+            self.q[i + 1]
+                + 0.5
+                    * (nets[self.connected_nets_i[0]].current[i]
+                        - nets[self.connected_nets_i[1]].current[i])
+        });
+
+        // set `q` to attempt to satisfy the constraints of the different types of components.
+        const FACTOR_R: f = 1.0;
+        const FACTOR_L: f = 0.0;
+        let mut q_next = self.q;
+        match self.value {
+            LinearComponentValue::Capacitive(_) | LinearComponentValue::Source(_) => {
+                // V = q[0] / C   // V = <const>
+                q_next[1] = i_target[0];
+                q_next[2] = i_target[1];
+                // q_next[2] = 0.0;
+            }
+            LinearComponentValue::Resistive(r) => {
+                // V = q[1] R  ->  q[1] = V / R
+                q_next[1] = FACTOR_R.lerp(-v_target / r, i_target[0]);
+                q_next[2] = i_target[1];
+                // q_next[2] = 0.0;
+                // dbg!(v_target, i_target, self.q[1], q_next[1]);
+            }
+            LinearComponentValue::Inductive(l) => {
+                // V = q[2] L  ->  q[2] = V / L
+                q_next[2] = FACTOR_L.lerp(-v_target / l, i_target[1]);
+                // dbg!(v_target, i_target, self.q[2], q_next[2]);
+            }
+        }
+
+        let converged = converged(self.q[1], q_next[1]) && converged(self.q[2], q_next[2]);
+        self.q = q_next;
+        converged
+    }
+
     fn tick(&mut self, dt: f) {
         self.q[1] += self.q[2] * dt;
         self.q[0] += self.q[1] * dt;
-        // self.q[0] += self.q[1] * dt * 0.5;
-        // self.q[1] += self.q[2] * dt;
-        // self.q[0] += self.q[1] * dt * 0.5;
-        // dbg!(self.q);
-    }
-    fn update_v(&mut self) {
-        self.v = self.value.voltage(self.q);
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct NetComponentEntry {
-    component_i: usize,
-    negate: bool,
+type HasConverged = bool;
+fn converged(prev: f, next: f) -> HasConverged {
+    const EPSILON: f = 1e-12;
+    (prev - next).abs() <= EPSILON
+}
+fn converged_to_zero(v: f) -> HasConverged {
+    const EPSILON: f = 0.0;
+    v.abs() <= EPSILON
 }
 
 #[derive(Debug, Clone)]
 pub struct NetState {
-    components: Vec<NetComponentEntry>,
-    i_through: [f; 2],
-    voltage_accepted: f,
-    voltage_accum: f,
+    components: Vec<(usize, usize)>,
+    /// `= [I, d/dt I]`, where `I` is excess current being created or destroyed at the junction (should be zero).
+    current: [f; 2],
+    current_sources: u16,
+    voltage: f,
+    voltage_accumulator: f,
+    voltage_accumulator_sources: u16,
+}
+impl NetState {
+    fn new_empty() -> Self {
+        Self {
+            components: Vec::new(),
+            current: [0.0; 2],
+            current_sources: 0,
+            voltage: 0.0,
+            voltage_accumulator: 0.0,
+            voltage_accumulator_sources: 0,
+        }
+    }
+    fn apply_accumulated_voltage(&mut self) -> HasConverged {
+        if self.voltage_accumulator_sources == 0 {
+            return true;
+        }
+        let voltage_next = self.voltage_accumulator / self.voltage_accumulator_sources as f;
+        let converged = converged(self.voltage, voltage_next);
+
+        self.voltage = voltage_next;
+        self.voltage_accumulator = 0.0;
+        self.voltage_accumulator_sources = 0;
+
+        converged
+    }
+    fn normalize_current(&mut self) {
+        if self.current_sources == 0 {
+            return;
+        }
+        self.current[0] /= self.current_sources as f;
+        self.current[1] /= self.current_sources as f;
+        self.current_sources = 0;
+    }
+    fn current_converged(&self) -> HasConverged {
+        let converged = self.current.map(|v| converged_to_zero(v));
+        true || converged[0] && converged[1]
+    }
 }
 
 pub fn make_rc_test() {
-    let mut state = CircuitState {
-        components: vec![
-            ComponentState {
-                connected_nets: [0, 1],
-                value: ComponentValue::Inductive(0.01),
-                q: [0.0, 0.0, 0.0],
-                v: 1.0,
-            },
-            ComponentState {
-                connected_nets: [0, 1],
-                value: ComponentValue::Capacitive(0.01),
-                q: [0.01, 0.0, 0.0],
-                v: 1.0,
-            },
-            // ComponentState {
-            //     connected_nets: [0, 1],
-            //     value: ComponentValue::Capacitive(1.0),
-            //     q: [1.0, 0.0, 0.0],
-            //     v: 1.0,
-            // },
-            ComponentState {
-                connected_nets: [0, 1],
-                value: ComponentValue::Resistive(10.0),
-                q: [0.0, 0.0, 0.0],
-                v: 1.0,
-            },
-        ],
-        nets: vec![
-            NetState {
-                components: vec![
-                    NetComponentEntry {
-                        component_i: 0,
-                        negate: false,
-                    },
-                    NetComponentEntry {
-                        component_i: 1,
-                        negate: false,
-                    },
-                    NetComponentEntry {
-                        component_i: 2,
-                        negate: false,
-                    },
-                ],
-                i_through: [0.0, 0.0],
-                voltage_accepted: 0.0,
-                voltage_accum: 0.0,
-            },
-            NetState {
-                components: vec![
-                    NetComponentEntry {
-                        component_i: 0,
-                        negate: true,
-                    },
-                    NetComponentEntry {
-                        component_i: 1,
-                        negate: true,
-                    },
-                    NetComponentEntry {
-                        component_i: 2,
-                        negate: true,
-                    },
-                ],
-                i_through: [0.0, 0.0],
-                voltage_accepted: 0.0,
-                voltage_accum: 0.0,
-            },
-        ],
-    };
+    let mut circuit = CircuitState::new_empty();
 
-    dbg!(state.solve_state_initial());
+    let nets_i = [
+        circuit.create_net(),
+        circuit.create_net(),
+        circuit.create_net(),
+    ];
 
-    let n = 100_001;
-    // let n = 5;
+    let c = circuit.create_component(
+        ComponentValueEnum::Linear(LinearComponentValue::Capacitive(0.1)),
+        &[nets_i[0], nets_i[1]],
+    );
+    circuit.create_component(
+        ComponentValueEnum::Linear(LinearComponentValue::Resistive(2.0)),
+        &[nets_i[1], nets_i[2]],
+    );
+    circuit.create_component(
+        ComponentValueEnum::Linear(LinearComponentValue::Inductive(0.1)),
+        &[nets_i[2], nets_i[0]],
+    );
+
+    let ComponentStateEnum::Linear(c) = &mut circuit.components[c];
+    // else {
+    //     unreachable!()
+    // };
+    c.q[0] = -1.0; // push 1C of charge in the capacitor
+
+    dbg!(circuit.solve_state());
+
+    let n = 1_000_001;
     let dt = 0.000_01;
     // let mut j = Vec::with_capacity(n);
     let mut prev = Vec::new();
     for i in 0..n {
-        prev.push(state.components[0].v);
-        if i % 10000 == 0 {
+        let v = circuit.nets[0].voltage - circuit.nets[1].voltage;
+        prev.push(v);
+        if i % 1000 == 0 {
             dbg!(prev
                 .drain(..)
                 .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)));
         }
-        // dbg!(state.components[0].v);
-        // j.push(state.components[0].v);
-        if !state.tick(dt) {
+        // dbg!(v);
+        // j.push(v);
+        if !circuit.tick(dt) {
+            dbg!(circuit);
             dbg!("convergence failed!");
             break;
         }
@@ -189,172 +303,110 @@ pub fn make_rc_test() {
     // dbg!(j);
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CircuitState {
-    components: Vec<ComponentState>,
+    components: Vec<ComponentStateEnum>,
     nets: Vec<NetState>,
 }
 impl CircuitState {
-    pub fn tick(&mut self, dt: f) -> bool {
+    pub fn new_empty() -> Self {
+        Self {
+            components: Vec::new(),
+            nets: Vec::new(),
+        }
+    }
+
+    pub fn create_net(&mut self) -> usize {
+        self.nets.push(NetState::new_empty());
+        self.nets.len() - 1
+    }
+    pub fn create_component(
+        &mut self,
+        value: ComponentValueEnum,
+        connected_nets_i: &[usize],
+    ) -> usize {
+        for net_i in connected_nets_i.iter() {
+            assert!(*net_i < self.nets.len(), "net id invalid");
+        }
+        let component = value.create(connected_nets_i);
+        let component_i = self.components.len();
+        self.components.push(component);
+        for (terminal_i, net_i) in connected_nets_i.iter().enumerate() {
+            self.nets[*net_i].components.push((component_i, terminal_i));
+        }
+        component_i
+    }
+
+    pub fn tick(&mut self, dt: f) -> HasConverged {
         for component in self.components.iter_mut() {
-            component.tick(dt);
+            component.as_mut().tick(dt);
         }
         self.solve_state()
     }
-    fn perturb_voltages(&mut self, convergence_thresh: f) -> bool {
-        for net in &mut self.nets {
-            net.voltage_accum = 0.0;
-        }
-        for ComponentState {
-            connected_nets, v, ..
-        } in &self.components
-        {
-            let accepted = connected_nets.map(|i| self.nets[i].voltage_accepted);
-            let delta = (v - (accepted[1] - accepted[0])) * 0.5;
-            let target = [accepted[0] - delta, accepted[1] + delta];
-            for i in 0..connected_nets.len() {
-                self.nets[i].voltage_accum += target[i];
-            }
-        }
-        let range = self
-            .nets
-            .iter()
-            .map(|net| net.voltage_accum / net.components.len() as f)
-            .map(|v| (v, v))
-            .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
-            .unwrap_or((0.0, 0.0));
-        let range = (range.1 - range.0) + f::EPSILON;
 
-        let mut changed = false;
-        for net in &mut self.nets {
-            let new_accepted = net.voltage_accum / net.components.len() as f;
-            if (new_accepted - net.voltage_accepted).abs() / range > convergence_thresh {
-                changed = true;
-            }
-            net.voltage_accepted = new_accepted;
-        }
-
-        // dbg!(self
-        //     .nets
-        //     .iter()
-        //     .map(|v| v.voltage_accepted)
-        //     .collect::<Vec<_>>());
-
-        changed
-    }
-    fn compute_i_through(&mut self) {
-        for net in &mut self.nets {
-            net.i_through = [0.0, 0.0];
-            for component_ent in &net.components {
-                let component = &self.components[component_ent.component_i];
-                if component_ent.negate {
-                    net.i_through[0] -= component.q[1];
-                    net.i_through[1] -= component.q[2];
+    pub fn solve_state(&mut self) -> HasConverged {
+        for i in 0..1000 {
+            let mut converged = true;
+            for _ in 0..10 {
+                if !self.correct_voltages(((i * 1349) as f).sin() * 0.5 + 0.5) {
+                    converged = false;
                 } else {
-                    net.i_through[0] += component.q[1];
-                    net.i_through[1] += component.q[2];
+                    break;
                 }
             }
-        }
-    }
-    fn perturb_charge_states(&mut self, step: f, convergence_thresh: f) -> bool {
-        self.compute_i_through();
-        let mut changed = false;
-        for component_state in &mut self.components {
-            let q_prev = component_state.q;
-            let mut q = q_prev;
-            let v_target = component_state
-                .connected_nets
-                .map(|net_i| self.nets[net_i].voltage_accepted);
-            let i_target = component_state.connected_nets.map(|net_i| {
-                self.nets[net_i]
-                    .i_through
-                    .map(|i| i / (self.nets[net_i].components.len() as f))
-            });
-            let i_target = [
-                // (i_target[0][0] - i_target[1][0]) * 0.5,
-                // (i_target[0][1] - i_target[1][1]) * 0.5,
-                q[1] + (i_target[1][0] - i_target[0][0]) * 0.5,
-                q[2] + (i_target[1][1] - i_target[0][1]) * 0.5,
-            ];
-
-            component_state
-                .value
-                .purturb(v_target[1] - v_target[0], i_target, step, 0.5, &mut q);
-            // component_state
-            //     .value
-            //     .purturb(v_target[1] - v_target[0], i_target, step, 1.0, &mut q);
-
-            // dbg!((q, q_prev));
-
-            component_state.q = q;
-
-            changed |= q.into_iter().zip(q_prev.into_iter()).any(|(a, b)| {
-                (a - b).abs() / (a * b + f::EPSILON).abs().sqrt() > convergence_thresh
-            });
-        }
-        self.update_component_voltages();
-
-        // dbg!(self.nets.iter().map(|v| v.i_through).collect::<Vec<_>>());
-
-        changed
-    }
-    fn update_component_voltages(&mut self) {
-        for component in &mut self.components {
-            component.update_v();
-        }
-    }
-
-    fn solve_state_initial(&mut self) -> bool {
-        const SOLVE_STEP_SIZE: f = 1.0;
-        const SOLVE_CONVERGENCE_THRESH: f = 0.0;
-        let mut solved = false;
-
-        self.update_component_voltages();
-        for _ in 0..100 {
-            let changed = self.perturb_voltages(SOLVE_CONVERGENCE_THRESH);
-            if !changed {
-                solved = true;
-                break;
-            }
-        }
-        if !solved {
-            return false;
-        }
-        solved = false;
-        for _ in 0..1000 {
-            let changed = self.perturb_voltages(SOLVE_CONVERGENCE_THRESH)
-                || self.perturb_charge_states(SOLVE_STEP_SIZE, SOLVE_CONVERGENCE_THRESH);
-            if !changed {
-                solved = true;
-                break;
-            }
-        }
-        if !solved {
-            return false;
-        }
-
-        true
-    }
-    fn solve_state(&mut self) -> bool {
-        const SOLVE_STEP_SIZE: f = 1.0;
-        const SOLVE_CONVERGENCE_THRESH: f = 1e-3;
-
-        self.update_component_voltages();
-        for i in 0..10000 {
-            let mut changed = false;
-            if self.perturb_voltages(SOLVE_CONVERGENCE_THRESH) {
-                changed = true;
-            }
-            if self.perturb_charge_states(SOLVE_STEP_SIZE, SOLVE_CONVERGENCE_THRESH) {
-                changed = true;
+            if !self.correct_charge_states() {
+                converged = false;
             }
 
-            if !changed {
+            if converged {
                 // dbg!(i);
                 return true;
             }
         }
         false
+    }
+
+    fn correct_voltages(&mut self, step: f) -> HasConverged {
+        for component in &self.components {
+            component
+                .as_ref()
+                .impart_voltage_to_nets(&mut self.nets, step);
+        }
+
+        let mut converged = true;
+        for net in &mut self.nets {
+            if !net.apply_accumulated_voltage() {
+                converged = false;
+            }
+        }
+
+        // let v = self.nets.iter().map(|v| v.voltage).collect::<Vec<_>>();
+        // // dbg!(format!("[{},{}]", v[0], v[1]));
+        // dbg!(v);
+
+        converged
+    }
+    fn correct_charge_states(&mut self) -> HasConverged {
+        for net in &mut self.nets {
+            net.current = [0.0; 2];
+        }
+        for component in &self.components {
+            component.as_ref().impart_currents_to_nets(&mut self.nets);
+        }
+        for net in &mut self.nets {
+            net.normalize_current();
+        }
+
+        let mut converged = true;
+        for component in &mut self.components {
+            if !component.as_mut().purturb_from_nets(&mut self.nets) {
+                converged = false;
+            }
+        }
+
+        // let i = self.nets.iter().map(|v| v.current).collect::<Vec<_>>();
+        // dbg!(i);
+
+        converged && self.nets.iter().all(|net| net.current_converged())
     }
 }

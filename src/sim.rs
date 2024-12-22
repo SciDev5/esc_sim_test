@@ -208,6 +208,65 @@ pub fn make_rc_test() {
     // dbg!(j);
 }
 
+pub fn make_mosfet_test() {
+    let mut circuit = CircuitState::new_empty();
+
+    let nets_i = [
+        circuit.create_net(),
+        circuit.create_net(),
+        circuit.create_net(),
+    ];
+
+    circuit.create_component(
+        ComponentValueEnum::Linear(LinearComponentValue::Source(5.0)),
+        &[nets_i[0], nets_i[1]],
+    );
+    circuit.create_component(
+        ComponentValueEnum::Linear(LinearComponentValue::Source(5.0)),
+        &[nets_i[2], nets_i[1]],
+    );
+    dbg!(circuit.solve_state());
+
+    let mosfet = circuit.create_component(
+        ComponentValueEnum::MOSFET(MOSFETComponentValue {
+            beta: 0.02,
+            ty: components::MOSFETDopingType::PChannel,
+            body_diode_ideality_facotor: 1.0,
+            body_diode_saturation_current: 0.1,
+            threshold_voltage: 1.0,
+        }),
+        &[nets_i[0], nets_i[2], nets_i[1]],
+    );
+
+    dbg!(circuit.solve_state());
+
+    let ComponentStateEnum::MOSFET(mosfet) = &mut circuit.components[mosfet] else {
+        unreachable!();
+    };
+
+    dbg!(mosfet.i);
+    dbg!(circuit.nets[1].voltage - circuit.nets[0].voltage);
+
+    // let n = 1_000_001;
+    // let dt = 0.000_01;
+    // let mut prev = Vec::new();
+    // for i in 0..n {
+    // let v = circuit.nets[1].voltage - circuit.nets[0].voltage;
+    //     prev.push(v);
+    //     if i % 1000 == 0 {
+    //         let v = prev
+    //             .drain(..)
+    //             .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // dbg!(v);
+    //     }
+    //     if !circuit.tick(dt) {
+    //         dbg!(circuit);
+    //         dbg!("convergence failed!");
+    //         break;
+    //     }
+    // }
+}
+
 #[derive(Debug)]
 pub struct CircuitState {
     components: Vec<ComponentStateEnum>,
@@ -250,7 +309,7 @@ impl CircuitState {
     }
 
     pub fn solve_state(&mut self) -> HasConverged {
-        for i in 0..1000 {
+        for i in 0..10000 {
             let mut converged = true;
             for _ in 0..10 {
                 if !self.correct_voltages(((i * 1349) as f).sin() * 0.5 + 0.5) {
@@ -264,7 +323,7 @@ impl CircuitState {
             }
 
             if converged {
-                // dbg!(i);
+                dbg!(i);
                 return true;
             }
         }

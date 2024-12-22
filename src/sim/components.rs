@@ -171,6 +171,7 @@ pub struct MOSFETComponentState {
     connected_nets_i: [usize; 3],
     pub value: MOSFETComponentValue,
     pub i: [f; 2],
+    pub v_gs_positive: f,
     pub temperature: f,
 }
 
@@ -190,6 +191,7 @@ impl MOSFETComponentState {
             connected_nets_i: [0; 3],
             value,
             i: [0.0; 2],
+            v_gs_positive: 0.0,
             temperature: 295.0,
         };
         this.set_nets(connected_nets_i);
@@ -220,13 +222,16 @@ impl ComponentState for MOSFETComponentState {
             body_diode_saturation_current,
         } = self.value;
         let i_ds = self.i[0];
-        let v_gs = nets[self.connected_nets_i[1]].voltage - nets[self.connected_nets_i[0]].voltage;
-        let (v_gs, i_ds) = match doping_type {
-            MOSFETDopingType::PChannel => (-v_gs, i_ds),
-            MOSFETDopingType::NChannel => (v_gs, -i_ds),
+        let i_ds = match doping_type {
+            MOSFETDopingType::PChannel => i_ds,
+            MOSFETDopingType::NChannel => -i_ds,
         };
-        const SATURATION_RESISTANCE: f = 1e9; // one gigaohm lol
+        let v_gs = self.v_gs_positive;
+
+        // dbg!("V", v_gs, i_ds, v_gs - v_th);
+        // const SATURATION_RESISTANCE: f = 1e9; // one gigaohm lol
         let v_ds = if i_ds < 0.0 {
+            // dbg!("V: // diode //");
             // body diode forward flow //
             -((-i_ds) / body_diode_saturation_current + 1.0).ln()
                 * (body_diode_ideality_facotor * self.temperature
@@ -235,18 +240,23 @@ impl ComponentState for MOSFETComponentState {
             let v_ctrl = v_gs - v_th;
 
             if v_ctrl > 0.0 {
-                if v_ctrl * v_ctrl > 2.0 * i_ds / beta {
+                // dbg!(v_ctrl * v_ctrl, 2.0 * i_ds / beta);
+                if v_ctrl * v_ctrl * 0.99999 > 2.0 * i_ds / beta {
+                    // dbg!("V: //TRIODE//");
                     // linear/triode region //
                     v_ctrl - (v_ctrl * v_ctrl - 2.0 * i_ds / beta).sqrt()
                 } else {
+                    // dbg!("V: //SATURATION//");
                     // saturation region //
-                    // have near infinite resistance for all current above saturation point
-                    v_ctrl + SATURATION_RESISTANCE * (i_ds - beta * 0.5 * v_ctrl * v_ctrl)
+                    return; // no influence on voltage
+                            // // have near infinite resistance for all current above saturation point
+                            // v_ctrl + SATURATION_RESISTANCE * (i_ds - beta * 0.5 * v_ctrl * v_ctrl)
                 }
             } else {
+                // dbg!("V: //CLOSED//");
                 // closed region //
-                // have near infinite resistance
-                SATURATION_RESISTANCE * i_ds
+                // no influence on voltage
+                return;
             }
         };
         let v_ds = match doping_type {
@@ -258,12 +268,13 @@ impl ComponentState for MOSFETComponentState {
             nets[self.connected_nets_i[2]].voltage - nets[self.connected_nets_i[0]].voltage;
 
         let v_diff = (v_ds - v_ds_prev) * 0.5 * step;
+        // dbg!(i_ds, v_ds, v_ds_prev);
 
         let net_source = &mut nets[self.connected_nets_i[0]];
-        net_source.voltage_accumulator = net_source.voltage - v_diff;
+        net_source.voltage_accumulator += net_source.voltage - v_diff;
         net_source.voltage_accumulator_sources += 1;
         let net_drain = &mut nets[self.connected_nets_i[2]];
-        net_drain.voltage_accumulator = net_drain.voltage + v_diff;
+        net_drain.voltage_accumulator += net_drain.voltage + v_diff;
         net_drain.voltage_accumulator_sources += 1;
     }
 
@@ -293,21 +304,31 @@ impl ComponentState for MOSFETComponentState {
             MOSFETDopingType::PChannel => (-v_gs, -v_ds),
             MOSFETDopingType::NChannel => (v_gs, v_ds),
         };
+
+        // dbg!("P", v_gs, v_ds);
+
         let i_ds = if v_ds > 0.0 {
             let v_ctrl = v_gs - v_th;
             beta * if v_ctrl > 0.0 {
-                if v_ctrl > v_ds {
+                if v_ds < v_ctrl {
+                    // dbg!("P: // linear/triode region //");
                     // linear/triode region //
                     v_ctrl * v_ds - v_ds * v_ds * 0.5
                 } else {
+                    // dbg!("P: // saturation region //");
                     // saturation region //
                     v_ctrl * v_ctrl * 0.5
                 }
             } else {
+                // dbg!("P: // closed region //");
                 // closed region //
-                0.0
+                let i_next = [0.0; 2];
+                let converged = converged(self.i[0], i_next[0]) && converged(self.i[1], i_next[1]);
+                self.i = i_next;
+                return converged;
             }
         } else {
+            // dbg!("P: // diode //");
             // body diode //
             -body_diode_saturation_current
                 * ((-v_ds * ELEMENTARY_CHARGE_OVER_BOLTZMANN_CONSTANT
@@ -316,6 +337,7 @@ impl ComponentState for MOSFETComponentState {
                     .exp()
                     - 1.0)
         };
+        // dbg!(i_ds);
         let i_ds = match doping_type {
             MOSFETDopingType::PChannel => i_ds,
             MOSFETDopingType::NChannel => -i_ds,
@@ -330,8 +352,11 @@ impl ComponentState for MOSFETComponentState {
         });
 
         let i_next = [0.5.lerp(i_ds, i_target[0]), i_target[1]];
-        let converged = converged(self.i[0], i_next[0]) && converged(self.i[1], i_next[1]);
+        let converged = converged(self.i[0], i_next[0])
+            && converged(self.i[1], i_next[1])
+            && converged(self.v_gs_positive, v_gs);
         self.i = i_next;
+        self.v_gs_positive = v_gs;
         converged
     }
 
